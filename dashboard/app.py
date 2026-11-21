@@ -2,6 +2,7 @@
 import os
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -21,6 +22,14 @@ st.set_page_config(
 
 REFRESH_INTERVAL = "3s"
 WARNING_THRESHOLD = 3.0
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+SNAPSHOT_EVENTS = DATA_DIR / "machine_events.csv"
+SNAPSHOT_METRICS = DATA_DIR / "machine_metrics.csv"
+
+
+def snapshot_mode():
+    """Cloud demo mode when no database credentials are configured."""
+    return not (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_PASSWORD"))
 
 
 
@@ -75,6 +84,16 @@ def read_query(conn, query, params=None):
 
 
 def load_data():
+    if snapshot_mode():
+        if not SNAPSHOT_EVENTS.is_file() or not SNAPSHOT_METRICS.is_file():
+            raise FileNotFoundError(
+                "Snapshot CSV files missing under data/. "
+                "Commit machine_events.csv and machine_metrics.csv for cloud deployment."
+            )
+        events = pd.read_csv(SNAPSHOT_EVENTS, encoding="utf-8-sig")
+        metrics = pd.read_csv(SNAPSHOT_METRICS, encoding="utf-8-sig")
+        return events, metrics, len(events)
+
     with get_connection() as conn:
         events = read_query(conn, """
             SELECT
@@ -152,7 +171,7 @@ def break_long_gaps(
 
                 gap_row["event_time"] = (
                     previous_time.loc[index]
-                    + pd.Timedelta(seconds=1)
+                    + timedelta(seconds=1)
                 )
 
                 gap_row[value_column] = float("nan")
@@ -185,7 +204,8 @@ selected_minutes = st.selectbox(
 )
 
 st.caption(
-    "Dashboard automatically refreshes every 3 seconds. "
+    "Local database mode refreshes every 3 seconds. "
+    "Hosted snapshot mode shows the latest exported data (not live). "
     "Timestamps are shown in UTC."
 )
 
@@ -205,8 +225,8 @@ def live_dashboard():
         )
     except Exception as exc:
         st.error(
-            "Unable to retrieve data from PostgreSQL. "
-            "Check database connectivity."
+            "Unable to load monitoring data. Check PostgreSQL connection "
+            "or the exported CSV snapshot files."
         )
         st.exception(exc)
         return
@@ -222,7 +242,12 @@ def live_dashboard():
         return
 
     now = pd.Timestamp.now(tz="UTC")
-    cutoff = now - timedelta(minutes=int(selected_minutes))
+    latest_event_time = events["event_time"].max()
+    is_snapshot = snapshot_mode()
+    # Anchor historical filters to the last stored event, not today's clock.
+    # Otherwise charts would become empty days after deployment.
+    reference_time = latest_event_time if is_snapshot else now
+    cutoff = reference_time - timedelta(minutes=int(selected_minutes))
 
     recent_events = events[
         events["event_time"] >= cutoff
@@ -232,21 +257,26 @@ def live_dashboard():
         metrics["event_time"] >= cutoff
     ].copy()
 
-    latest_event_time = events["event_time"].max()
     data_age = max(
         0,
         (now - latest_event_time).total_seconds(),
     )
 
-    if data_age > 15:
+    if is_snapshot:
+        st.info(
+            "Historical snapshot demo — NOT a live Kafka connection. "
+            f"Last recorded sensor event (UTC): {latest_event_time}. "
+            "Local mode uses Kafka, PostgreSQL, and automatic refresh."
+        )
+    elif data_age > 15:
         st.warning(
             f"No new telemetry for {data_age:.0f} seconds. "
             "Showing stored historical data."
         )
 
     # Summary KPIs
-    active_cutoff = now - timedelta(minutes=5)
-    minute_cutoff = now - timedelta(minutes=1)
+    active_cutoff = reference_time - timedelta(minutes=5)
+    minute_cutoff = reference_time - timedelta(minutes=1)
 
     active_machines = events.loc[
         events["event_time"] >= active_cutoff,
@@ -270,11 +300,11 @@ def live_dashboard():
         f"{total_events:,}",
     )
     col2.metric(
-        "Active Machines (5 min)",
+        "Machines (last 5 recorded min)" if is_snapshot else "Active Machines (5 min)",
         int(active_machines),
     )
     col3.metric(
-        "Avg Temperature (1 min)",
+        "Avg Temp (last recorded min)" if is_snapshot else "Avg Temperature (1 min)",
         f"{avg_temp:.1f} °C"
         if pd.notna(avg_temp) else "N/A",
     )
@@ -434,15 +464,16 @@ def live_dashboard():
             )
 
     st.caption(
-        f"Latest event (UTC): {latest_event_time} | "
-        f"Last refresh (UTC): {now}"
+        f"Latest recorded event (UTC): {latest_event_time} | "
+        f"Page refresh (UTC): {now} | "
+        f"Mode: {'snapshot' if is_snapshot else 'live PostgreSQL'}"
     )
 
     total_seconds = time.perf_counter() - refresh_start
 
     st.caption(
         f"Server refresh time: {total_seconds:.2f}s | "
-        f"Database queries: {query_seconds:.2f}s"
+        f"Data loading: {query_seconds:.2f}s"
     )
 
     print(
