@@ -1,0 +1,38 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Testing and linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Debug logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
