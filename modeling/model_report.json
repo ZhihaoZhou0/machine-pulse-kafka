@@ -1,0 +1,60 @@
+{
+  "method": "per-machine StandardScaler + Ridge one-step-ahead vibration regression",
+  "data_source": "machine_events.csv",
+  "evaluation": "chronological 70/30 holdout per machine; normal training subset only",
+  "warning": "Synthetic demonstration. Flags are prediction-error outliers, not verified physical machine failures; holdout includes synthetic fault periods.",
+  "total_holdout_examples": 175,
+  "total_holdout_anomaly_flags": 52,
+  "machines": {
+    "CNC-01": {
+      "total_sequence_examples": 114,
+      "train_pool_size": 79,
+      "normal_training_examples": 25,
+      "holdout_examples": 35,
+      "holdout_mae_mm_s": 0.318,
+      "holdout_rmse_mm_s": 0.5646,
+      "error_threshold_mm_s": 0.35,
+      "holdout_anomaly_flags": 8
+    },
+    "CNC-02": {
+      "total_sequence_examples": 114,
+      "train_pool_size": 79,
+      "normal_training_examples": 30,
+      "holdout_examples": 35,
+      "holdout_mae_mm_s": 1.0428,
+      "holdout_rmse_mm_s": 1.8861,
+      "error_threshold_mm_s": 0.35,
+      "holdout_anomaly_flags": 24
+    },
+    "LATHE-01": {
+      "total_sequence_examples": 114,
+      "train_pool_size": 79,
+      "normal_training_examples": 42,
+      "holdout_examples": 35,
+      "holdout_mae_mm_s": 0.2379,
+      "holdout_rmse_mm_s": 0.4606,
+      "error_threshold_mm_s": 0.35,
+      "holdout_anomaly_flags": 5
+    },
+    "PRESS-01": {
+      "total_sequence_examples": 114,
+      "train_pool_size": 79,
+      "normal_training_examples": 52,
+      "holdout_examples": 35,
+      "holdout_mae_mm_s": 0.5034,
+      "holdout_rmse_mm_s": 0.8359,
+      "error_threshold_mm_s": 0.35,
+      "holdout_anomaly_flags": 10
+    },
+    "PRESS-02": {
+      "total_sequence_examples": 114,
+      "train_pool_size": 79,
+      "normal_training_examples": 48,
+      "holdout_examples": 35,
+      "holdout_mae_mm_s": 0.2158,
+      "holdout_rmse_mm_s": 0.4722,
+      "error_threshold_mm_s": 0.35,
+      "holdout_anomaly_flags": 5
+    }
+  }
+}

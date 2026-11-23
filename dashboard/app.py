@@ -1,6 +1,7 @@
 
 import os
 import time
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -25,6 +26,8 @@ WARNING_THRESHOLD = 3.0
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SNAPSHOT_EVENTS = DATA_DIR / "machine_events.csv"
 SNAPSHOT_METRICS = DATA_DIR / "machine_metrics.csv"
+SNAPSHOT_PREDICTIONS = DATA_DIR / "machine_predictions.csv"
+MODEL_REPORT = DATA_DIR.parent / "modeling" / "model_report.json"
 
 
 def snapshot_mode():
@@ -184,6 +187,151 @@ def break_long_gaps(
     )
 
 
+
+
+def load_predictions(is_snapshot):
+    """Read the optional sequential-model output without affecting core charts."""
+    if is_snapshot:
+        if not SNAPSHOT_PREDICTIONS.is_file():
+            return pd.DataFrame()
+        frame = pd.read_csv(SNAPSHOT_PREDICTIONS, encoding="utf-8-sig")
+    else:
+        with get_connection() as conn:
+            frame = read_query(conn, """
+                SELECT event_id, machine_id, event_time,
+                       actual_vibration, predicted_vibration,
+                       absolute_error, anomaly_threshold,
+                       is_anomaly, model_name, predicted_at
+                FROM machine_predictions
+                ORDER BY event_time DESC
+                LIMIT 2000
+            """)
+    if frame.empty:
+        return frame
+    frame["event_time"] = pd.to_datetime(frame["event_time"], utc=True)
+    # PostgreSQL returns booleans, while CSV values may be strings.
+    frame["is_anomaly"] = (
+        frame["is_anomaly"].astype(str).str.strip().str.lower().isin(["true", "t", "1"])
+    )
+    for column in ["actual_vibration", "predicted_vibration", "absolute_error", "anomaly_threshold"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def show_predictive_maintenance(predictions, cutoff, is_snapshot):
+    """Bonus charts are based on stored model outputs, never recomputed in Streamlit."""
+    st.divider()
+    st.header("Predictive Maintenance — Sequential Modeling Bonus")
+    st.caption(
+        "Per-machine Ridge-AR6 models predict each vibration reading using the "
+        "previous six readings. Anomalies are prediction-error outliers, "
+        "not verified physical machine failures."
+    )
+    if predictions.empty:
+        st.info("No model predictions available yet. Run the prediction consumer, "
+                "or export data/machine_predictions.csv for the hosted snapshot.")
+        return
+
+    filtered = predictions[predictions["event_time"] >= cutoff].copy()
+    if filtered.empty:
+        st.info("No predictions in this time range. Select a longer range.")
+        return
+
+    total = len(filtered)
+    flagged = int(filtered["is_anomaly"].sum())
+    mae = float(filtered["absolute_error"].mean())
+    machine_count = int(filtered["machine_id"].nunique())
+    a, b, c, d = st.columns(4)
+    a.metric("Predictions (range)", f"{total:,}")
+    b.metric("Model anomaly flags", f"{flagged:,}")
+    c.metric("Mean absolute error (range)", f"{mae:.3f} mm/s")
+    d.metric("Predicted machines", machine_count)
+
+    available = sorted(filtered["machine_id"].dropna().unique().tolist())
+    default_machine = available.index("CNC-02") if "CNC-02" in available else 0
+    machine_id = st.selectbox(
+        "Inspect machine predictions", available, index=default_machine,
+        key="bonus_prediction_machine",
+    )
+    selected = filtered[filtered["machine_id"] == machine_id].sort_values("event_time")
+
+    st.subheader("Actual vs Predicted Vibration")
+    comparison = go.Figure()
+    for field, label, color in [
+        ("actual_vibration", "Actual", "#2563eb"),
+        ("predicted_vibration", "Predicted (Ridge-AR6)", "#ea580c"),
+    ]:
+        # Gap rows prevent lines from connecting separate producer sessions.
+        gapped = break_long_gaps(selected, field, gap_seconds=15)
+        comparison.add_trace(go.Scatter(
+            x=gapped["event_time"], y=gapped[field],
+            name=label, mode="lines+markers", connectgaps=False,
+            line=dict(color=color), marker=dict(size=5),
+        ))
+    anomalies = selected[selected["is_anomaly"]]
+    if not anomalies.empty:
+        comparison.add_trace(go.Scatter(
+            x=anomalies["event_time"], y=anomalies["actual_vibration"],
+            name="Model anomaly", mode="markers",
+            marker=dict(color="#dc2626", symbol="x", size=12),
+        ))
+    comparison.update_layout(height=380, xaxis_title="Time (UTC)",
+                             yaxis_title="Vibration (mm/s)")
+    st.plotly_chart(comparison, width="stretch")
+
+    st.subheader("Prediction Error vs Calibrated Threshold")
+    errors = go.Figure()
+    for field, label, color, dash in [
+        ("absolute_error", "Absolute prediction error", "#6366f1", "solid"),
+        ("anomaly_threshold", "Model anomaly threshold", "#dc2626", "dash"),
+    ]:
+        gapped = break_long_gaps(selected, field, gap_seconds=15)
+        errors.add_trace(go.Scatter(
+            x=gapped["event_time"], y=gapped[field],
+            name=label, mode="lines", connectgaps=False,
+            line=dict(color=color, dash=dash),
+        ))
+    errors.update_layout(height=330, xaxis_title="Time (UTC)",
+                         yaxis_title="Absolute error (mm/s)")
+    st.plotly_chart(errors, width="stretch")
+
+    st.subheader("Recent Model Anomalies")
+    all_anomalies = filtered[filtered["is_anomaly"]].sort_values(
+        "event_time", ascending=False
+    )
+    if all_anomalies.empty:
+        st.info("No model anomaly flags in the selected time range.")
+    else:
+        st.dataframe(all_anomalies[[
+            "event_time", "machine_id", "actual_vibration",
+            "predicted_vibration", "absolute_error", "anomaly_threshold",
+        ]].head(20), hide_index=True, width="stretch")
+
+    if MODEL_REPORT.is_file():
+        try:
+            report = json.loads(MODEL_REPORT.read_text(encoding="utf-8"))
+            entries = report.get("machines", {})
+            if entries:
+                with st.expander("Chronological holdout evaluation (training-time results)"):
+                    st.caption(
+                        "70/30 chronological split per machine; normal training subset. "
+                        "MAE/RMSE describe one-step forecast errors, not fault-classification accuracy."
+                    )
+                    evaluation = pd.DataFrame([
+                        {"Machine": key,
+                         "Holdout examples": value.get("holdout_examples"),
+                         "MAE (mm/s)": value.get("holdout_mae_mm_s"),
+                         "RMSE (mm/s)": value.get("holdout_rmse_mm_s"),
+                         "Anomaly flags": value.get("holdout_anomaly_flags")}
+                        for key, value in entries.items()
+                    ])
+                    st.dataframe(evaluation, hide_index=True, width="stretch")
+        except (OSError, json.JSONDecodeError) as exc:
+            st.caption(f"Model evaluation report unavailable: {exc}")
+    st.caption("Mode: historical CSV snapshot" if is_snapshot else
+               "Mode: PostgreSQL (updated by independent Kafka model consumer)")
+
+
 st.title("🏭 Machine Pulse")
 st.caption(
     "Real-Time Industrial Equipment Monitoring | "
@@ -244,10 +392,14 @@ def live_dashboard():
     now = pd.Timestamp.now(tz="UTC")
     latest_event_time = events["event_time"].max()
     is_snapshot = snapshot_mode()
-    # Anchor historical filters to the last stored event, not today's clock.
-    # Otherwise charts would become empty days after deployment.
-    reference_time = latest_event_time if is_snapshot else now
-    cutoff = reference_time - timedelta(minutes=int(selected_minutes))
+    # Keep truly live windows relative to wall-clock time. When there is no
+    # telemetry in the requested window, show the latest recorded time window
+    # instead of hiding all charts (common when reviewing a finished demo).
+    requested_window = timedelta(minutes=int(selected_minutes))
+    stale_window = (now - latest_event_time) > requested_window
+    historical_view = is_snapshot or stale_window
+    reference_time = latest_event_time if historical_view else now
+    cutoff = reference_time - requested_window
 
     recent_events = events[
         events["event_time"] >= cutoff
@@ -267,6 +419,13 @@ def live_dashboard():
             "Historical snapshot demo — NOT a live Kafka connection. "
             f"Last recorded sensor event (UTC): {latest_event_time}. "
             "Local mode uses Kafka, PostgreSQL, and automatic refresh."
+        )
+    elif stale_window:
+        st.warning(
+            f"No new telemetry for {data_age:.0f} seconds. "
+            f"The selected {int(selected_minutes)}-minute period has no live events, "
+            f"so charts are anchored to the last recorded event ({latest_event_time}). "
+            "This is historical data, not a live feed."
         )
     elif data_age > 15:
         st.warning(
@@ -300,11 +459,11 @@ def live_dashboard():
         f"{total_events:,}",
     )
     col2.metric(
-        "Machines (last 5 recorded min)" if is_snapshot else "Active Machines (5 min)",
+        "Machines (last 5 recorded min)" if historical_view else "Active Machines (5 min)",
         int(active_machines),
     )
     col3.metric(
-        "Avg Temp (last recorded min)" if is_snapshot else "Avg Temperature (1 min)",
+        "Avg Temp (last recorded min)" if historical_view else "Avg Temperature (1 min)",
         f"{avg_temp:.1f} °C"
         if pd.notna(avg_temp) else "N/A",
     )
@@ -463,10 +622,17 @@ def live_dashboard():
                 hide_index=True,
             )
 
+    try:
+        prediction_data = load_predictions(is_snapshot)
+    except (psycopg.Error, ValueError, OSError, KeyError) as exc:
+        st.warning(f"Optional sequential-model data could not be loaded: {exc}")
+        prediction_data = pd.DataFrame()
+    show_predictive_maintenance(prediction_data, cutoff, is_snapshot)
+
     st.caption(
         f"Latest recorded event (UTC): {latest_event_time} | "
         f"Page refresh (UTC): {now} | "
-        f"Mode: {'snapshot' if is_snapshot else 'live PostgreSQL'}"
+        f"Mode: {'snapshot' if is_snapshot else 'PostgreSQL historical view' if historical_view else 'live PostgreSQL'}"
     )
 
     total_seconds = time.perf_counter() - refresh_start
