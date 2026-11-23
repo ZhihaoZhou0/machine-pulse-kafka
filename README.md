@@ -1,6 +1,6 @@
 # Machine Pulse — Real-Time Industrial Equipment Monitoring
 
-**Public Streamlit dashboard:** **Deployment pending — replace this line with the public Streamlit URL before submitting.**
+**Public Streamlit Dashboard:** https://machine-pulse-kafka.streamlit.app/
 **Assignment:** IDS 706 — Week 13 Major Assignment: Real-Time Streaming System with Apache Kafka
 **Run environment:** Windows PowerShell, Python 3.12, Docker Desktop
 
