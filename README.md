@@ -8,6 +8,8 @@
 
 **Run environment:** Windows PowerShell, Python 3.12, Docker Desktop
 
+**Bonus Extension (up to 15 points): Sequential Modeling — Ridge-AR6 Predictive Maintenance, live Kafka inference, and anomaly detection.**
+
 ## 1. Project overview and problem
 
 Machine Pulse is an end-to-end event-streaming system that monitors a simulated factory fleet. Five industrial machines continuously emit readings for temperature, vibration, rotational speed, and operating state. An Apache Kafka producer publishes the telemetry; three independent consumer groups store raw readings, compute vibration-based health indicators, and perform sequential vibration prediction; PostgreSQL persists raw events, derived metrics, and model predictions; and a Streamlit dashboard automatically refreshes to show equipment behavior and alerts.
@@ -29,7 +31,7 @@ flowchart TD
     J --> P
     C --> E[("PostgreSQL<br/>machine_events")]
     D --> F[("PostgreSQL<br/>machine_metrics")]
-    P --> H[("PostgreSQL<br/>machine_predictions")]
+    P --> H[("PostgreSQL<br/>machine_predictions + machine_prediction_state")]
     E --> G["Streamlit dashboard<br/>3-second live refresh"]
     F --> G
     H --> G
@@ -39,7 +41,7 @@ flowchart TD
     X --> Y["Public Streamlit Community Cloud<br/>historical snapshot only"]
 ```
 
-**Data movement:** Producer → Kafka topic → three independent consumers → three PostgreSQL tables → auto-refreshing local Streamlit dashboard. A separately trained per-machine Ridge model is loaded by the prediction consumer. The public deployed app uses exported CSV snapshots rather than connecting to the local Docker database. Streamlit reads persisted results; it does **not** calculate the streaming rolling average itself.
+**Data movement:** Producer → Kafka topic → three independent consumers → three PostgreSQL result tables (plus durable prediction state) → auto-refreshing local Streamlit dashboard. A separately trained per-machine Ridge model is loaded by the prediction consumer. The public deployed app uses exported CSV snapshots rather than connecting to the local Docker database. Streamlit reads persisted results; it does **not** calculate the streaming rolling average itself.
 
 ### Kafka design
 
@@ -108,13 +110,13 @@ The result of **each processed event** is written to the separate `machine_metri
 
 ### Sequential prediction results — `machine_predictions`
 
-The third consumer (`consumers/prediction_consumer.py`) uses its own Kafka group, loads the trained `Ridge-AR6` model bundle, and predicts each machine's current vibration from its **six preceding readings**. Each prediction is persisted in `machine_predictions` with `event_id`, `machine_id`, `event_time`, actual and predicted vibration, absolute error, anomaly threshold, `is_anomaly`, model name, and `predicted_at`. A primary key on `event_id` prevents duplicate prediction rows on replay. The consumer commits a Kafka offset only after successful processing and database persistence. A gap longer than 15 seconds resets its short per-machine history. See Section 8 for model assumptions, training, evaluation, and commands.
+The third consumer (`consumers/prediction_consumer.py`) uses its own Kafka group, loads the trained `Ridge-AR6` model bundle, and predicts each machine's current vibration from its **six preceding readings**. Each prediction is persisted in `machine_predictions` with `event_id`, `machine_id`, `event_time`, actual and predicted vibration, absolute error, anomaly threshold, `is_anomaly`, model name, and `predicted_at`. A primary key on `event_id` prevents duplicate prediction rows on replay. The consumer also saves its last event time and six-reading history per machine in `machine_prediction_state`; each prediction (if available) and the new state are written within **one PostgreSQL transaction**. The Kafka offset is committed **only after this transaction succeeds**. On restart, the consumer restores **its own** durable history instead of borrowing newer raw-storage readings; replayed events at or before the saved time do not advance state again. A gap longer than 15 seconds resets the six-reading sequence. New or previously untracked machines need six readings to warm up. This supports normal crash/restart recovery for the single-partition, per-machine ordered demonstration; it is not a general-purpose late-event reconciliation system. See Section 8 for model assumptions, training, evaluation, and commands.
 
 **This is different from the required 30-second rolling-average alert:** the required stream processor uses a fixed level threshold, while the bonus predicts the next value from a sequence and flags unusually large **prediction residuals**.
 
 ## 5. Dashboard
 
-The Streamlit app (`dashboard/app.py`) reads both PostgreSQL tables and refreshes its live section **automatically every 3 seconds**, without requiring a browser reload.
+The Streamlit app (`dashboard/app.py`) reads the PostgreSQL result tables and refreshes its live section **automatically every 3 seconds**, without requiring a browser reload.
 
 **Four summary metrics:** total recorded events; active machines with readings in the previous five minutes; mean temperature in the previous minute; and number of warnings within the selected display range.
 
@@ -150,7 +152,7 @@ machine-pulse-kafka/
 ├── sql/
 │   ├── schema.sql
 │   ├── metrics.sql
-│   └── predictions.sql
+│   └── predictions.sql  # machine_predictions + machine_prediction_state
 ├── docs/
 │   └── screenshots/
 │       ├── database_ingestion.png
@@ -208,7 +210,7 @@ Get-Content .\sql\metrics.sql -Raw | docker exec -i machine-pulse-postgres psql 
 Get-Content .\sql\predictions.sql -Raw | docker exec -i machine-pulse-postgres psql -U machinepulse -d machinepulse -v ON_ERROR_STOP=1
 ```
 
-The SQL scripts use `CREATE TABLE IF NOT EXISTS` and can be run again without dropping existing data.
+The SQL scripts use `CREATE TABLE IF NOT EXISTS` and can be run again without dropping existing data. `predictions.sql` also creates `machine_prediction_state`, which the prediction consumer requires for safe restarts. **If upgrading an existing installation, rerun only `predictions.sql` before restarting the prediction consumer**; no existing prediction or event rows need to be deleted.
 
 ### Step 5 — Create the Kafka topic
 
@@ -247,7 +249,7 @@ This uses the included historical `data/machine_events.csv` and writes `modeling
 .\.venv\Scripts\python.exe -m consumers.prediction_consumer
 ```
 
-Expected message: `Listening to machine-telemetry | group=machine-pulse-sequential-model | model=Ridge-AR6`. Start it **before a fresh producer run** so it can consume the new stream and maintain correctly ordered per-machine histories. Only load locally trained or otherwise trusted `.joblib` artifacts.
+Expected message: `Listening to machine-telemetry | group=machine-pulse-sequential-model | model=Ridge-AR6`. Start it **before a fresh producer run**. Its six-reading per-machine sequence is saved in `machine_prediction_state` with transactional updates and restored on restart, without pulling later observations from the raw consumer. For a new installation, the first six readings per machine are warmup events. Only load locally trained or otherwise trusted `.joblib` artifacts.
 
 ### Step 8 — Start the dashboard (separate terminal)
 
@@ -331,7 +333,7 @@ CNC-02 showed the largest holdout error and most residual anomaly flags, consist
 
 ### Run and verify the Kafka inference extension
 
-Apply `sql/predictions.sql`, then start the **prediction consumer** before the producer (see Section 7). It subscribes to `machine-telemetry` as `machine-pulse-sequential-model`, loads `modeling/machine_vibration_model.joblib`, maintains an ordered six-reading history per machine, and inserts predictions into `machine_predictions`. A `PRIMARY KEY(event_id)` plus `ON CONFLICT DO NOTHING` avoids duplicate prediction rows.
+Apply `sql/predictions.sql`, then start the **prediction consumer** before the producer (see Section 7). It subscribes to `machine-telemetry` as `machine-pulse-sequential-model`, loads `modeling/machine_vibration_model.joblib`, maintains a **durably stored** ordered six-reading history per machine in `machine_prediction_state`, and inserts predictions into `machine_predictions`. Model state and inference output are committed in the same database transaction, before Kafka offset commit. A `PRIMARY KEY(event_id)` plus `ON CONFLICT DO NOTHING` avoids duplicate prediction rows.
 
 A short integration demonstration can be started in the producer terminal:
 
@@ -381,7 +383,7 @@ The screenshots are **supporting evidence**. The runnable source code, setup ins
 - The one-broker, one-partition local Kafka setup is intended for reproducible coursework, not high-availability production operation.
 - The **sequential Ridge-AR6 prediction extension is implemented** and tested on synthetic data; no verified ground-truth fault labels, precision, recall, or production-grade calibration are claimed.
 - Historical normal-training samples are relatively few (25–52 per machine); all learned residual thresholds hit the 0.35 mm/s floor. Stronger calibration and more varied normal data would be needed before operational use.
-- Prediction history recovery/offset handling assumes a correctly ordered demo stream; a production system would need stronger transactional recovery and late-event handling.
+- The prediction consumer transactionally persists per-machine history and inference results before acknowledging Kafka offsets, preventing raw-storage read-ahead during restarts. The demonstration still assumes one ordered Kafka partition and does not implement general late-event repair, model version migrations, or distributed exactly-once Kafka-to-PostgreSQL coordination.
 - Apache Flink is **not implemented**. It is an alternative future streaming/windowing extension.
 
 ## 11. Secrets and repository hygiene

@@ -20,3 +20,14 @@ CREATE INDEX IF NOT EXISTS idx_predictions_machine_time
 
 CREATE INDEX IF NOT EXISTS idx_predictions_anomaly
     ON machine_predictions (is_anomaly, event_time DESC);
+
+-- Durable per-machine AR(6) history. Updated in the SAME transaction as
+-- machine_predictions, so crashes cannot advance the model state without
+-- committing the prediction result (or vice versa).
+CREATE TABLE IF NOT EXISTS machine_prediction_state (
+    machine_id TEXT PRIMARY KEY,
+    last_event_id UUID NOT NULL,
+    last_event_time TIMESTAMPTZ NOT NULL,
+    recent_readings JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
